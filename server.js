@@ -1,8 +1,23 @@
 import http from "http";
+import express from "express";
+import cors from "cors";
+import multer from "multer";
 import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT || 8080;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
 const rooms = new Map();
+const app = express();
+
+app.use(cors());
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 25 * 1024 * 1024
+  }
+});
 
 function ensureRoom(roomId) {
   if (!rooms.has(roomId)) {
@@ -45,21 +60,124 @@ function broadcastToRoom(roomId, payload) {
   return count;
 }
 
-const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      rooms: Array.from(rooms.keys()),
-      roomCount: rooms.size
-    }));
-    return;
+function countWords(text) {
+  return (text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function analyzeSegments(segments) {
+  const bySpeaker = {};
+  let totalDuration = 0;
+  let interruptions = 0;
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const speaker = seg.speaker || "Unknown";
+    const start = Number(seg.start || 0);
+    const end = Number(seg.end || 0);
+    const duration = Math.max(0, end - start);
+    const words = countWords(seg.text);
+
+    totalDuration += duration;
+
+    if (!bySpeaker[speaker]) {
+      bySpeaker[speaker] = {
+        speaker,
+        turns: 0,
+        duration: 0,
+        words: 0
+      };
+    }
+
+    bySpeaker[speaker].turns += 1;
+    bySpeaker[speaker].duration += duration;
+    bySpeaker[speaker].words += words;
+
+    if (i > 0) {
+      const prev = segments[i - 1];
+      const prevEnd = Number(prev.end || 0);
+      const gap = start - prevEnd;
+      if (prev.speaker !== speaker && gap < 0.35) {
+        interruptions += 1;
+      }
+    }
   }
 
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Sottotitoli WebSocket server is running.");
+  const speakers = Object.values(bySpeaker)
+    .map(item => ({
+      ...item,
+      avgTurnDuration: item.turns ? item.duration / item.turns : 0,
+      shareOfTime: totalDuration ? item.duration / totalDuration : 0
+    }))
+    .sort((a, b) => b.duration - a.duration);
+
+  return {
+    totalDuration,
+    interruptions,
+    speakers
+  };
+}
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    rooms: Array.from(rooms.keys()),
+    roomCount: rooms.size,
+    openaiConfigured: !!OPENAI_API_KEY
+  });
 });
 
+app.post("/analyze-speakers", upload.single("file"), async (req, res) => {
+  try {
+    if (!OPENAI_API_KEY) {
+      res.status(500).send("OPENAI_API_KEY is not configured on the server.");
+      return;
+    }
+
+    if (!req.file) {
+      res.status(400).send("No audio file uploaded.");
+      return;
+    }
+
+    const formData = new FormData();
+    const blob = new Blob([req.file.buffer], {
+      type: req.file.mimetype || "application/octet-stream"
+    });
+
+    formData.append("file", blob, req.file.originalname || "session.webm");
+    formData.append("model", "gpt-4o-transcribe-diarize");
+    formData.append("response_format", "diarized_json");
+    formData.append("chunking_strategy", "auto");
+
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: formData
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      res.status(500).send(text || "OpenAI transcription request failed.");
+      return;
+    }
+
+    const data = await response.json();
+    const segments = Array.isArray(data.segments) ? data.segments : [];
+    const analytics = analyzeSegments(segments);
+
+    res.json({
+      text: data.text || "",
+      duration: data.duration || 0,
+      segments,
+      analytics
+    });
+  } catch (error) {
+    res.status(500).send(error.message || "Speaker analysis failed.");
+  }
+});
+
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
