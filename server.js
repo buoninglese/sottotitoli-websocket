@@ -1,29 +1,58 @@
 import http from "http";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT || 8080;
 const rooms = new Map();
 
-function getRoom(roomId) {
-  if (!rooms.has(roomId)) rooms.set(roomId, new Set());
+function ensureRoom(roomId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Set());
+  }
   return rooms.get(roomId);
 }
 
-function broadcast(roomId, payload) {
-  const room = getRoom(roomId);
+function leaveCurrentRoom(ws) {
+  if (!ws.roomId) return;
+  const room = rooms.get(ws.roomId);
+  if (!room) return;
+
+  room.delete(ws);
+  if (room.size === 0) {
+    rooms.delete(ws.roomId);
+  }
+}
+
+function joinRoom(ws, roomId) {
+  leaveCurrentRoom(ws);
+  ws.roomId = roomId;
+  ensureRoom(roomId).add(ws);
+}
+
+function broadcastToRoom(roomId, payload) {
+  const room = rooms.get(roomId);
+  if (!room) return 0;
+
   const message = JSON.stringify(payload);
+  let count = 0;
 
   for (const client of room) {
-    if (client.readyState === 1) {
+    if (client.readyState === WebSocket.OPEN) {
       client.send(message);
+      count += 1;
     }
   }
+
+  return count;
 }
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify({
+      ok: true,
+      rooms: Array.from(rooms.keys()),
+      roomCount: rooms.size
+    }));
     return;
   }
 
@@ -35,15 +64,14 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  let roomId = url.searchParams.get("room") || "default";
-  ws.roomId = roomId;
+  const requestedRoom = url.searchParams.get("room") || "default";
 
-  getRoom(roomId).add(ws);
+  joinRoom(ws, requestedRoom);
 
   ws.send(JSON.stringify({
     type: "system",
     event: "connected",
-    room: roomId
+    room: ws.roomId
   }));
 
   ws.on("message", (raw) => {
@@ -51,37 +79,46 @@ wss.on("connection", (ws, req) => {
       const payload = JSON.parse(raw.toString());
 
       if (payload.join && typeof payload.join === "string") {
-        const oldRoom = ws.roomId;
-        if (rooms.has(oldRoom)) rooms.get(oldRoom).delete(ws);
-
-        ws.roomId = payload.join;
-        roomId = payload.join;
-        getRoom(roomId).add(ws);
+        joinRoom(ws, payload.join);
 
         ws.send(JSON.stringify({
           type: "system",
           event: "joined",
-          room: roomId
+          room: ws.roomId
         }));
         return;
       }
 
-      broadcast(ws.roomId, payload);
+      const outbound = {
+        ...payload,
+        room: ws.roomId,
+        serverTs: new Date().toISOString()
+      };
+
+      const delivered = broadcastToRoom(ws.roomId, outbound);
+
+      ws.send(JSON.stringify({
+        type: "system",
+        event: "broadcast",
+        room: ws.roomId,
+        delivered
+      }));
     } catch (error) {
       ws.send(JSON.stringify({
         type: "system",
         event: "error",
+        room: ws.roomId,
         message: "Invalid JSON payload"
       }));
     }
   });
 
   ws.on("close", () => {
-    const room = rooms.get(ws.roomId);
-    if (room) {
-      room.delete(ws);
-      if (room.size === 0) rooms.delete(ws.roomId);
-    }
+    leaveCurrentRoom(ws);
+  });
+
+  ws.on("error", () => {
+    leaveCurrentRoom(ws);
   });
 });
 
