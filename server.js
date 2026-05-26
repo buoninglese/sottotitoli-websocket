@@ -9,7 +9,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 const rooms = new Map();
 const app = express();
-
+app.use(express.json({ limit: '100kb' }));
 app.use(cors({
   origin: (origin, cb) => {
     const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -21,7 +21,7 @@ app.use(cors({
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 25 * 1024 * 1024
+    fileSize: 25 * 1024 * 1024  // 25 MB max — cost guardrail
   }
 });
 
@@ -46,7 +46,20 @@ function leaveCurrentRoom(ws) {
 function joinRoom(ws, roomId) {
   leaveCurrentRoom(ws);
   ws.roomId = roomId;
-  ensureRoom(roomId).add(ws);
+  const MAX_ROOMS = 1000;
+  if (!rooms.has(roomId) && rooms.size >= MAX_ROOMS) {
+    ws.send(JSON.stringify({ type: "system", event: "error", message: "Server at capacity" }));
+    ws.close();
+    return;
+  }
+  const room = ensureRoom(roomId);
+  const MAX_CLIENTS_PER_ROOM = 50;
+  if (room.size >= MAX_CLIENTS_PER_ROOM) {
+    ws.send(JSON.stringify({ type: "system", event: "error", message: "Room full" }));
+    ws.close();
+    return;
+  }
+  room.add(ws);
 }
 
 function broadcastToRoom(roomId, payload) {
@@ -142,6 +155,11 @@ app.post("/analyze-speakers", upload.single("file"), async (req, res) => {
       return;
     }
 
+    const ALLOWED_MIMES = ['audio/webm', 'audio/wav', 'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/x-m4a'];
+    if (!ALLOWED_MIMES.includes(req.file.mimetype)) {
+      return res.status(400).json({ error: `Unsupported audio type: ${req.file.mimetype}` });
+    }
+
     const formData = new FormData();
     const blob = new Blob([req.file.buffer], {
       type: req.file.mimetype || "application/octet-stream"
@@ -197,8 +215,17 @@ wss.on("connection", (ws, req) => {
     room: ws.roomId
   }));
 
+  // Heartbeat: mark alive, respond to pings
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on("message", (raw) => {
     try {
+      const MAX_RAW_SIZE = 20000;
+      if (raw.toString().length > MAX_RAW_SIZE) {
+        ws.send(JSON.stringify({ type: "system", event: "error", message: "Message too large" }));
+        return;
+      }
       const payload = JSON.parse(raw.toString());
 
       if (payload.join && typeof payload.join === "string") {
@@ -209,6 +236,12 @@ wss.on("connection", (ws, req) => {
           event: "joined",
           room: ws.roomId
         }));
+        return;
+      }
+
+      const ALLOWED_TYPES = ['caption', 'translation', 'system'];
+      if (payload.type && !ALLOWED_TYPES.includes(payload.type)) {
+        ws.send(JSON.stringify({ type: "system", event: "error", message: "Invalid message type" }));
         return;
       }
 
@@ -245,6 +278,27 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (!ws.isAlive) {
+      leaveCurrentRoom(ws);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => clearInterval(heartbeatInterval));
+
 server.listen(PORT, () => {
   console.log(`Sottotitoli WebSocket server listening on ${PORT}`);
 });
+// Clean up stale rooms every 5 minutes
+setInterval(() => {
+  for (const [roomId, clients] of rooms) {
+    if (clients.size === 0) {
+      rooms.delete(roomId);
+    }
+  }
+}, 300000);
