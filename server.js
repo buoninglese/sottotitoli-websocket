@@ -10,7 +10,13 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const rooms = new Map();
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: (origin, cb) => {
+    const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!origin || allowed.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS origin not allowed'));
+  }
+}));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -118,15 +124,13 @@ function analyzeSegments(segments) {
 }
 
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    rooms: Array.from(rooms.keys()),
-    roomCount: rooms.size,
-    openaiConfigured: !!OPENAI_API_KEY
-  });
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
 app.post("/analyze-speakers", upload.single("file"), async (req, res) => {
+      if (process.env.INTERNAL_API_KEY && req.headers['x-api-key'] !== process.env.INTERNAL_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
   try {
     if (!OPENAI_API_KEY) {
       res.status(500).send("OPENAI_API_KEY is not configured on the server.");
@@ -156,9 +160,10 @@ app.post("/analyze-speakers", upload.single("file"), async (req, res) => {
       body: formData
     });
 
-    if (!response.ok) {
+       if (!response.ok) {
       const text = await response.text();
-      res.status(500).send(text || "OpenAI transcription request failed.");
+      console.error('OpenAI error:', text);  // log server-side only
+      res.status(502).json({ error: 'Transcription provider failed' });
       return;
     }
 
