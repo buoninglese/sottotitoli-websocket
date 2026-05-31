@@ -6,8 +6,10 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
 
 const rooms = new Map();
+const deepgramSockets = new Map(); // roomId → { ws, lang, pendingFinal: '' }
 const app = express();
 app.use(express.json({ limit: '100kb' }));
 app.use(cors({
@@ -136,6 +138,104 @@ function analyzeSegments(segments) {
   };
 }
 
+// ── Deepgram streaming helpers ──
+
+function closeDeepgram(roomId) {
+  const dg = deepgramSockets.get(roomId);
+  if (!dg) return;
+  try {
+    // Send close message so Deepgram finalizes
+    if (dg.ws.readyState === WebSocket.OPEN) {
+      dg.ws.send(JSON.stringify({ type: "CloseStream" }));
+      dg.ws.close();
+    }
+  } catch (e) { /* ignore */ }
+  deepgramSockets.delete(roomId);
+}
+
+function startDeepgram(roomId, lang) {
+  // Close any existing connection for this room
+  closeDeepgram(roomId);
+
+  if (!DEEPGRAM_API_KEY) {
+    console.error("Deepgram API key not configured");
+    return null;
+  }
+
+  // Map language codes to Deepgram's expected format
+  const langMap = {
+    'en-US': 'en', 'en-GB': 'en', 'it-IT': 'it', 'fr-FR': 'fr',
+    'es-ES': 'es', 'de-DE': 'de', 'nl-NL': 'nl', 'pt-PT': 'pt',
+    'pt-BR': 'pt', 'ja-JP': 'ja', 'ko-KR': 'ko', 'zh-CN': 'zh'
+  };
+  const deepgramLang = langMap[lang] || lang?.split('-')[0] || 'en';
+
+  const query = new URLSearchParams({
+    encoding: 'opus',
+    sample_rate: '48000',
+    channels: '1',
+    language: deepgramLang,
+    interim_results: 'true',
+    punctuate: 'true',
+    model: 'nova-2'
+  }).toString();
+
+  const dgWs = new WebSocket(`wss://api.deepgram.com/v1/listen?${query}`, {
+    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
+  });
+
+  const dg = { ws: dgWs, lang, pendingFinal: '' };
+  deepgramSockets.set(roomId, dg);
+
+  dgWs.on('open', () => {
+    console.log(`Deepgram streaming started for room ${roomId} (${lang})`);
+  });
+
+  dgWs.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type !== 'Results') return;
+
+      const alt = msg.channel?.alternatives?.[0];
+      if (!alt?.transcript) return;
+
+      const transcript = alt.transcript.trim();
+      if (!transcript) return;
+
+      if (msg.is_final) {
+        // Final result — broadcast as caption final
+        dg.pendingFinal = '';
+        broadcastToRoom(roomId, {
+          msg: true,
+          final: transcript,
+          id: Date.now(),
+          label: 'deepgram'
+        });
+      } else {
+        // Interim result
+        broadcastToRoom(roomId, {
+          msg: true,
+          interm: transcript,
+          id: Date.now()
+        });
+      }
+    } catch (e) {
+      // Ignore parse errors on Deepgram messages
+    }
+  });
+
+  dgWs.on('error', (err) => {
+    console.error(`Deepgram error for room ${roomId}:`, err.message);
+  });
+
+  dgWs.on('close', () => {
+    console.log(`Deepgram connection closed for room ${roomId}`);
+    deepgramSockets.delete(roomId);
+  });
+
+  return dg;
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
@@ -239,6 +339,32 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
+      // ── Deepgram audio streaming messages ──
+      if (payload.type === "audio-start" && DEEPGRAM_API_KEY) {
+        startDeepgram(ws.roomId, payload.lang || 'en-US');
+        ws.send(JSON.stringify({ type: "system", event: "deepgram-ready", room: ws.roomId }));
+        return;
+      }
+
+      if (payload.type === "audio" && deepgramSockets.has(ws.roomId)) {
+        const dg = deepgramSockets.get(ws.roomId);
+        if (dg.ws.readyState === WebSocket.OPEN && payload.data) {
+          try {
+            const buf = Buffer.from(payload.data, 'base64');
+            dg.ws.send(buf);
+          } catch (e) {
+            // Ignore bad audio data
+          }
+        }
+        return;
+      }
+
+      if (payload.type === "audio-stop") {
+        closeDeepgram(ws.roomId);
+        ws.send(JSON.stringify({ type: "system", event: "deepgram-stopped", room: ws.roomId }));
+        return;
+      }
+
       const ALLOWED_TYPES = ['caption', 'translation', 'system'];
       if (payload.type && !ALLOWED_TYPES.includes(payload.type)) {
         ws.send(JSON.stringify({ type: "system", event: "error", message: "Invalid message type" }));
@@ -270,10 +396,19 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
+    // If this client was the only one using Deepgram for this room, clean up
+    const room = rooms.get(ws.roomId);
+    if (room && room.size <= 1) {
+      closeDeepgram(ws.roomId);
+    }
     leaveCurrentRoom(ws);
   });
 
   ws.on("error", () => {
+    const room = rooms.get(ws.roomId);
+    if (room && room.size <= 1) {
+      closeDeepgram(ws.roomId);
+    }
     leaveCurrentRoom(ws);
   });
 });
