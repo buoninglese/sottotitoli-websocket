@@ -177,6 +177,7 @@ function startDeepgram(roomId, lang) {
     language: deepgramLang,
     interim_results: 'true',
     punctuate: 'true',
+    smart_format: 'true',
     model: 'nova-2'
   }).toString();
 
