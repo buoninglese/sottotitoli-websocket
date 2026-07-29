@@ -166,12 +166,18 @@ router.post('/batch', (req, res) => {
 // ── GET /api/cefr/categories ────────────────────────────────────────────
 router.get('/categories', (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not available' });
+  const withCounts = req.query.counts === '1';
   const rows = stmtCategories.all();
-  // Add word count per category
-  const stmtCount = db.prepare('SELECT category_id, COUNT(DISTINCT word_id) AS cnt FROM word_categories GROUP BY category_id');
-  const counts = Object.fromEntries(stmtCount.all().map(r => [r.category_id, r.cnt]));
-  const enriched = rows.map(c => ({ ...c, word_count: counts[c.category_id] || 0 }));
-  res.json(enriched);
+  if (withCounts) {
+    // Expensive query — only run when explicitly requested
+    try {
+      const stmtCount = db.prepare('SELECT category_id, COUNT(*) AS cnt FROM word_categories GROUP BY category_id');
+      const counts = Object.fromEntries(stmtCount.all().map(r => [r.category_id, r.cnt]));
+      const enriched = rows.map(c => ({ ...c, word_count: counts[c.category_id] || 0 }));
+      return res.json(enriched);
+    } catch (_) { /* fall through to basic response */ }
+  }
+  res.json(rows);
 });
 
 // ── GET /api/cefr/gaps?below=A2&above=B2 ────────────────────────────────
