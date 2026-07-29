@@ -180,12 +180,13 @@ router.get('/categories', (req, res) => {
   res.json(rows);
 });
 
-// ── GET /api/cefr/gaps?below=A2&above=B2 ────────────────────────────────
+// ── GET /api/cefr/gaps?below=A2&above=B2&sort=freq-desc ─────────────────
 router.get('/gaps', (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not available' });
 
   const belowLevel = (req.query.below || '').trim().toUpperCase();
   const aboveLevel = (req.query.above || '').trim().toUpperCase();
+  const sortOrder = (req.query.sort === 'freq-asc') ? 'ASC' : 'DESC'; // default: most common first
   const validLevels = ['A1','A2','B1','B2','C1','C2'];
   if (!validLevels.includes(belowLevel) && !validLevels.includes(aboveLevel)) {
     return res.status(400).json({ error: 'Provide below=X and/or above=X (A1-C2)' });
@@ -206,7 +207,7 @@ router.get('/gaps', (req, res) => {
       LEFT JOIN categories c ON wc.category_id = c.category_id
       WHERE wp.level >= ? AND wp.level < ?
       GROUP BY w.word
-      ORDER BY wp.frequency_count ASC
+      ORDER BY wp.frequency_count ${sortOrder}
       LIMIT 200
     `);
     const rows = stmt.all(targetNum, targetNum + 1);
