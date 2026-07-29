@@ -11,6 +11,10 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const rooms = new Map();
 const app = express();
 app.use(express.json({ limit: '100kb' }));
+
+// CEFR API routes — mounted BEFORE main CORS (they have their own permissive CORS)
+app.use('/api/cefr', cefrRouter);
+
 app.use(cors({
   origin: (origin, cb) => {
     const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
