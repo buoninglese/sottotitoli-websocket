@@ -166,7 +166,57 @@ router.post('/batch', (req, res) => {
 // ── GET /api/cefr/categories ────────────────────────────────────────────
 router.get('/categories', (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not available' });
-  res.json(stmtCategories.all());
+  const rows = stmtCategories.all();
+  // Add word count per category
+  const stmtCount = db.prepare('SELECT category_id, COUNT(DISTINCT word_id) AS cnt FROM word_categories GROUP BY category_id');
+  const counts = Object.fromEntries(stmtCount.all().map(r => [r.category_id, r.cnt]));
+  const enriched = rows.map(c => ({ ...c, word_count: counts[c.category_id] || 0 }));
+  res.json(enriched);
+});
+
+// ── GET /api/cefr/gaps?below=A2&above=B2 ────────────────────────────────
+router.get('/gaps', (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not available' });
+
+  const belowLevel = (req.query.below || '').trim().toUpperCase();
+  const aboveLevel = (req.query.above || '').trim().toUpperCase();
+  const validLevels = ['A1','A2','B1','B2','C1','C2'];
+  if (!validLevels.includes(belowLevel) && !validLevels.includes(aboveLevel)) {
+    return res.status(400).json({ error: 'Provide below=X and/or above=X (A1-C2)' });
+  }
+
+  const levelMap = { A1: 1, A2: 2, B1: 3, B2: 4, C1: 5, C2: 6 };
+
+  function queryLevel(targetLevel) {
+    if (!validLevels.includes(targetLevel)) return [];
+    const targetNum = levelMap[targetLevel];
+    const stmt = db.prepare(`
+      SELECT w.word, pt.tag, wp.level, wp.frequency_count,
+             GROUP_CONCAT(c.category_title, ', ') AS topics
+      FROM word_pos wp
+      JOIN words w ON wp.word_id = w.word_id
+      JOIN pos_tags pt ON wp.pos_tag_id = pt.tag_id
+      LEFT JOIN word_categories wc ON wp.word_pos_id = wc.word_pos_id
+      LEFT JOIN categories c ON wc.category_id = c.category_id
+      WHERE wp.level >= ? AND wp.level < ?
+      GROUP BY w.word
+      ORDER BY wp.frequency_count ASC
+      LIMIT 200
+    `);
+    const rows = stmt.all(targetNum, targetNum + 1);
+    return rows.map(r => ({
+      word: r.word,
+      tag: r.tag,
+      level: ['','A1','A2','B1','B2','C1','C2'][Math.round(r.level)] || targetLevel,
+      frequency_count: r.frequency_count,
+      topics: r.topics || ''
+    }));
+  }
+
+  const result = {};
+  if (belowLevel) result.below = queryLevel(belowLevel);
+  if (aboveLevel) result.above = queryLevel(aboveLevel);
+  res.json(result);
 });
 
 // ── GET /api/cefr/category/:id ──────────────────────────────────────────
