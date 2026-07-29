@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import { WebSocketServer, WebSocket } from "ws";
+import cefrRouter from './routes/cefr.js';
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
@@ -139,6 +140,9 @@ function analyzeSegments(segments) {
 app.get("/health", (req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
+
+// CEFR vocabulary API (Words-CEFR-Dataset + CEFR.AI scoring)
+app.use('/api/cefr', cefrRouter);
 
 app.post("/analyze-speakers", upload.single("file"), async (req, res) => {
       if (process.env.INTERNAL_API_KEY && req.headers['x-api-key'] !== process.env.INTERNAL_API_KEY) {
