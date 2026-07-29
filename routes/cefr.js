@@ -19,6 +19,15 @@ const __dirname = dirname(__filename);
 
 const router = Router();
 
+// ── Permissive CORS for read-only public data ───────────────────────────
+router.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 // ── Open DB once at startup (read-only, in-memory cache) ────────────────
 const DB_PATH = join(__dirname, '..', 'word_cefr_minified.db');
 
