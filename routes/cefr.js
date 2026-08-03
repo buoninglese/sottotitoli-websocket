@@ -324,7 +324,11 @@ router.post('/analyze', (req, res) => {
     coverage: tokens.length > 0 ? Math.round((levelCount / tokens.length) * 100) + '%' : '0%',
     // Raw word data for client-side blending
     wordData: Object.fromEntries(
-      Object.entries(lookup).map(([word, entry]) => [word, { level: entry.level, frequency: entry.frequency_count }])
+      Object.entries(lookup).map(([word, entry]) => [word, {
+        level: entry.level,
+        frequency: entry.frequency_count,
+        topics: entry.topics ? entry.topics.split('||').filter(Boolean) : []
+      }])
     )
   });
 });
